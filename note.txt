@@ -1,0 +1,24 @@
+
+sudo gdisk /dev/sdb
+
+Some commands to usein the 
+gptfdisktool:
+p : print partitions information
+d : delete partition
+n : create new partition
+w : write partition
+q : exit gptfdisk
+
+--------------------------------------------------------------------------
+
+sudo dd if=main.bin of=/dev/sdb1 bs=512 seek=0 conv=fsync
+
+sudo dd if=weight.bin of=/dev/sdb2 bs=512 seek=0 conv=fsync
+
+sudo dd if=samples.bin of=/dev/sdb3 bs=512 seek=0 conv=fsync
+
+sudo minicom -D /dev/ttyUSB1 -b 115200
+
+---------------------------------------------------------------------------
+
+make bitstream SUB_PROJECT=arty100t CONFIG=SmallRocketArty100TConfig
