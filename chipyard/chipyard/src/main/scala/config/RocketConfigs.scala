@@ -15,20 +15,10 @@ class CNNWorkloadConfig extends Config(
   new chipyard.config.AbstractConfig
 )
 class RocketConfig extends Config(
-  new freechips.rocketchip.subsystem.WithNoMemPort ++                 // Ng?t c?ng DRAM ngoài
-  new testchipip.WithMbusScratchpad(size = BigInt(64 << 10)) ++        // G?n Scratchpad 64KB tr?c ti?p vào MBUS
+  new freechips.rocketchip.subsystem.WithNoMemPort ++           
+  new testchipip.WithMbusScratchpad(size = BigInt(64 << 10)) ++       
   new freechips.rocketchip.subsystem.WithNSmallCores(1) ++ 
   new chipyard.config.AbstractConfig)
-  
-class AsconRocketConfig extends Config(
-  new chipyard.ASCON.WithAsconRoCC ++
-  new chipyard.iobinders.WithDontTouchIOBinders(false) ++  
-  new freechips.rocketchip.subsystem.WithIncoherentBusTopology ++
-  new freechips.rocketchip.subsystem.WithNBanks(0) ++
-  new freechips.rocketchip.subsystem.WithNoMemPort ++
-  new freechips.rocketchip.subsystem.With1TinyCore ++      
-  new chipyard.config.AbstractConfig)
-  
 class RocketDDRConfig extends Config(
   new AdderRocc.WithAdderRoccAccel ++
   new chipyard.iobinders.WithDontTouchIOBinders(false) ++         // TODO FIX: Don't dontTouch the ports
