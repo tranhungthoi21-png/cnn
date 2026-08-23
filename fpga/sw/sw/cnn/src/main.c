@@ -22,8 +22,6 @@ static volatile uint32_t * const spi      = (void *)(SPI_CTRL_ADDR);
 #define NUM_CLASSES             6
 #define START_SECTOR_WEIGHTS    4096  
 #define START_SECTOR_ECG        8192  
-
-// Bảng phân bổ sector chuẩn xác cho từng class (mỗi class chiếm 500 sectors)
 const uint32_t class_base_sectors[NUM_CLASSES] = {
     8192,  // Class 0: Paced
     8692,  // Class 1: Atrial
@@ -86,12 +84,10 @@ int main(int hartid, char **argv) {
     
     kprintf("\n[C-TB] >>> STARTING FULL 6-CLASS CNN TESTBENCH <<< \r\n");
 
-    // Reset CNN ban đầu
     REG32(cnn_base, CNN_RESET_OFFSET) = 1;
     REG32(cnn_base, CNN_RESET_OFFSET) = 0;
     delay_cycles(120);
 
-    // 1. Đọc trọng số từ thẻ SD (4 sectors từ sector 4096 cho 458 weights)
     uint8_t weight_buffer[2048];
     for (int s = 0; s < 4; s++) {
         int err = read_sd_sector(START_SECTOR_WEIGHTS + s, &weight_buffer[s * 512]);
@@ -138,12 +134,10 @@ int main(int hartid, char **argv) {
                 continue;
             }
 
-            // Kích hoạt tín hiệu Start Inference
             REG32(cnn_base, CNN_START_INFER_OFFSET) = 1;
             REG32(cnn_base, CNN_START_INFER_OFFSET) = 0;
             delay_cycles(120);
-
-            // Gửi đúng 200 mẫu ECG thực tế (bỏ qua byte đệm thừa)
+            
             for (int i = 0; i < 200; i++) {
                 int8_t raw_val = (int8_t)sector_buffer[i];
                 uint32_t sample_data = ((uint32_t)((int32_t)raw_val)) & 0xFF;
@@ -168,7 +162,6 @@ int main(int hartid, char **argv) {
             
             uint32_t classification_result = REG32(cnn_base, CNN_CLASS_OFFSET);
             uint8_t predicted_label = (uint8_t)(classification_result & 0x07);
-
             if (predicted_label == (uint8_t)class_idx) {
                 pass_count++;
             } else {
