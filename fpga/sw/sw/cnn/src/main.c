@@ -1,52 +1,37 @@
 #include <stdint.h>
-#include <stddef.h>
 #include <platform.h>
 #include "kprintf.h"
 
 #define REG32(p, i) ((p)[(i) >> 2])
 
-#define SAMPLES_PER_CLASS      500
-#define START_SECTOR_WEIGHTS   4096   
-#define START_SECTOR_ECG       8192   
-
-#define CNN_CTRL_ADDR          0x06400000L
+#define CNN_CTRL_ADDR 0x06400000L
 static volatile uint32_t * const cnn_base = (void *)(CNN_CTRL_ADDR);
 static volatile uint32_t * const spi      = (void *)(SPI_CTRL_ADDR);
 
-#define CNN_REG_CONTROL        0x00  
-#define CNN_REG_DATA_IN        0x04  
-#define CNN_REG_READY          0x08  
-#define CNN_REG_CLASSIFICATION 0x0C  
-#define CNN_REG_DONE           0x10  
+#define CNN_RESET_OFFSET        0x00
+#define CNN_CONFIG_MODE_OFFSET  0x04
+#define CNN_WEIGHT_VALID_OFFSET 0x08
+#define CNN_WEIGHT_DATA_OFFSET  0x0C
+#define CNN_ECG_VALID_OFFSET    0x10
+#define CNN_ECG_DATA_OFFSET     0x14
+#define CNN_START_INFER_OFFSET  0x18
+#define CNN_CLASS_OFFSET        0x1C
+#define CNN_DONE_OFFSET         0x20
 
-#define CNN_CTRL_RESET         (1 << 0) 
-#define CNN_CTRL_START         (1 << 1) 
-#define CNN_CTRL_CONFIG        (1 << 2) 
-#define CNN_CTRL_WREN          (1 << 3) 
+#define SAMPLES_PER_CLASS       500   // 500 samples * 6 classes = 3000 samples
+#define NUM_CLASSES             6
+#define START_SECTOR_WEIGHTS    4096  
+#define START_SECTOR_ECG        8192  
 
-const char *CLASS_NAMES[6] = {
-    "Paced beat",                       
-    "Atrial premature beat",            
-    "Left bundle branch block",         
-    "Normal",                           
-    "Right bundle branch block",        
-    "Premature ventricular contraction" 
+// Bảng phân bổ sector chuẩn xác cho từng class (mỗi class chiếm 500 sectors)
+const uint32_t class_base_sectors[NUM_CLASSES] = {
+    8192,  // Class 0: Paced
+    8692,  // Class 1: Atrial
+    9192,  // Class 2: LBBB
+    9692,  // Class 3: Normal
+    10192, // Class 4: RBBB
+    10692  // Class 5: PVC
 };
-
-void print_dec(int val) {
-    if (val < 0) { kprintf("-"); val = -val; }
-    if (val / 10) print_dec(val / 10);
-    char c = '0' + (val % 10);
-    kprintf("%c", c);
-}
-
-void print_hex32(uint32_t val) {
-    char hex_chars[] = "0123456789ABCDEF";
-    kprintf("0x");
-    for (int i = 7; i >= 0; i--) {
-        kprintf("%c", hex_chars[(val >> (i * 4)) & 0x0F]);
-    }
-}
 
 static inline void delay_cycles(uint32_t cycles) {
     uint32_t start_val;
@@ -68,12 +53,11 @@ static inline uint8_t sd_spi_xfer(uint8_t d) {
 int read_sd_sector(uint32_t sector_addr, uint8_t *buffer) {
     REG32(spi, SPI_REG_CSMODE) = SPI_CSMODE_HOLD;
     sd_spi_xfer(0xFF);
-    
-    sd_spi_xfer(0x51); 
+
+    sd_spi_xfer(0x51);
     sd_spi_xfer(sector_addr >> 24); sd_spi_xfer(sector_addr >> 16);
     sd_spi_xfer(sector_addr >> 8);  sd_spi_xfer(sector_addr);
     sd_spi_xfer(0xFF);
-
     unsigned long n = 50000;
     while ((sd_spi_xfer(0xFF) & 0x80) != 0) if (--n == 0) { REG32(spi, SPI_REG_CSMODE) = SPI_CSMODE_AUTO; return -1; }
     n = 50000;
@@ -82,145 +66,132 @@ int read_sd_sector(uint32_t sector_addr, uint8_t *buffer) {
     sd_spi_xfer(0xFF); sd_spi_xfer(0xFF);
 
     REG32(spi, SPI_REG_CSMODE) = SPI_CSMODE_AUTO;
-    for(int d = 0; d < 8; d++) sd_spi_xfer(0xFF);
+    sd_spi_xfer(0xFF);
     return 0;
+}
+
+void print_heartbeat_info(uint8_t label) {
+    switch(label) {
+        case 0: kprintf("Paced"); break;
+        case 1: kprintf("Atrial"); break;
+        case 2: kprintf("LBBB"); break;
+        case 3: kprintf("Normal"); break;
+        case 4: kprintf("RBBB"); break;
+        default: kprintf("PVC"); break;
+    }
 }
 
 int main(int hartid, char **argv) {
     REG32(uart, UART_REG_TXCTRL) = UART_TXEN;
+    
+    kprintf("\n[C-TB] >>> STARTING FULL 6-CLASS CNN TESTBENCH <<< \r\n");
 
-    kprintf("\r\n========================================================\r\n");
-    kprintf(" CNN SYSTEM DEBUG: PREDICTION MAPPING TRACING\r\n");
-    kprintf("========================================================\r\n");
+    // Reset CNN ban đầu
+    REG32(cnn_base, CNN_RESET_OFFSET) = 1;
+    REG32(cnn_base, CNN_RESET_OFFSET) = 0;
+    delay_cycles(120);
 
-    // 1. HARDWARE RESET
-    REG32(cnn_base, CNN_REG_CONTROL) = CNN_CTRL_RESET;
-    delay_cycles(100);
-    REG32(cnn_base, CNN_REG_CONTROL) = 0;
-    delay_cycles(100);
-
-    // 2. PRELOAD WEIGHTS T? SD CARD
-    uint32_t weight_buffer_32[512];
-    uint8_t *weight_buffer_8 = (uint8_t*)weight_buffer_32;
-
+    // 1. Đọc trọng số từ thẻ SD (4 sectors từ sector 4096 cho 458 weights)
+    uint8_t weight_buffer[2048];
     for (int s = 0; s < 4; s++) {
-        read_sd_sector(START_SECTOR_WEIGHTS + s, &weight_buffer_8[s * 512]);
+        int err = read_sd_sector(START_SECTOR_WEIGHTS + s, &weight_buffer[s * 512]);
+        if (err != 0) {
+            kprintf("[ERROR] SD Weight Read Fail at sector %d\r\n", START_SECTOR_WEIGHTS + s);
+            while(1);
+        }
     }
+    uint32_t *weights_32 = (uint32_t*)weight_buffer;
 
-    REG32(cnn_base, CNN_REG_CONTROL) = CNN_CTRL_CONFIG;
+    kprintf("[C-TB] Step 1: Loading weights...\r\n");
+    REG32(cnn_base, CNN_CONFIG_MODE_OFFSET) = 1;
 
-    for (int w_idx = 0; w_idx < 458; w_idx++) {
-        REG32(cnn_base, CNN_REG_DATA_IN) = weight_buffer_32[w_idx] & 0x000FFFFF;
-        REG32(cnn_base, CNN_REG_CONTROL) = CNN_CTRL_CONFIG | CNN_CTRL_WREN;
-        REG32(cnn_base, CNN_REG_CONTROL) = CNN_CTRL_CONFIG;
+    for (int w = 0; w < 458; w++) {
+        REG32(cnn_base, CNN_WEIGHT_DATA_OFFSET) = weights_32[w] & 0x000FFFFF;
+        REG32(cnn_base, CNN_WEIGHT_VALID_OFFSET) = 1;
+        REG32(cnn_base, CNN_WEIGHT_VALID_OFFSET) = 0;
     }
     
-    REG32(cnn_base, CNN_REG_CONTROL) = 0;
+    REG32(cnn_base, CNN_CONFIG_MODE_OFFSET) = 0;
+    kprintf("[C-TB] Weight loading finished.\r\n");
+    delay_cycles(20);
 
-    kprintf("[TB] SUCCESS: 458 Weights loaded into SRAM.\r\n\r\n");
+    int total_pass_global = 0;
+    int total_samples_global = NUM_CLASSES * SAMPLES_PER_CLASS;
 
-    uint32_t class_pass_count[6] = {0};
-    uint32_t total_pass = 0;
+    // Duyệt qua từng Class (Từ 0 đến 5)
+    for (int class_idx = 0; class_idx < NUM_CLASSES; class_idx++) {
+        int pass_count = 0;
+        int fail_count = 0;
 
-    for (int class_idx = 0; class_idx < 6; class_idx++) {
-        uint32_t pass_count = 0;
-        uint32_t fail_count = 0;
-
-        kprintf("[TB] EVALUATING CLASS "); print_dec(class_idx); kprintf(": ");
-        kprintf((char*)CLASS_NAMES[class_idx]);
-        kprintf("\r\n[TB] --------------------------------------------------------\r\n");
+        kprintf("\r\n[C-TB] ===== EVALUATING CLASS %d: ", class_idx);
+        print_heartbeat_info(class_idx);
+        kprintf(" =====\r\n");
 
         for (int s_idx = 0; s_idx < SAMPLES_PER_CLASS; s_idx++) {
-            
-            uint32_t global_sample_idx = (class_idx * SAMPLES_PER_CLASS) + s_idx;
-            uint32_t target_sector = START_SECTOR_ECG + global_sample_idx;
-
             uint8_t sector_buffer[512];
-            if (read_sd_sector(target_sector, sector_buffer) != 0) continue;
+            
+            uint32_t target_sector = class_base_sectors[class_idx] + s_idx;
 
-            // STAGE 1: RESET & START
-            REG32(cnn_base, CNN_REG_CONTROL) = CNN_CTRL_RESET;
-            delay_cycles(20);
-            REG32(cnn_base, CNN_REG_CONTROL) = CNN_CTRL_START;
-
-            // STAGE 2: DELAY 28 CYCLES
-            delay_cycles(28);
-
-            // Polling ready_for_data == 1
-            while ((REG32(cnn_base, CNN_REG_READY) & 0x01) == 0);
-
-            for (int p = 0; p < 3; p++) { 
-                REG32(cnn_base, CNN_REG_DATA_IN) = 0; 
-                REG32(cnn_base, CNN_REG_CONTROL) = CNN_CTRL_START | CNN_CTRL_WREN;
-                REG32(cnn_base, CNN_REG_CONTROL) = CNN_CTRL_START;
+            int sd_err = read_sd_sector(target_sector, sector_buffer);
+            if (sd_err != 0) {
+                kprintf("[ERROR] SD read fail at sector %d (Class %d, Sample %d)\r\n", target_sector, class_idx, s_idx);
+                continue;
             }
 
+            // Kích hoạt tín hiệu Start Inference
+            REG32(cnn_base, CNN_START_INFER_OFFSET) = 1;
+            REG32(cnn_base, CNN_START_INFER_OFFSET) = 0;
+            delay_cycles(120);
+
+            // Gửi đúng 200 mẫu ECG thực tế (bỏ qua byte đệm thừa)
             for (int i = 0; i < 200; i++) {
-                uint32_t sample_data = ((uint32_t)sector_buffer[i]) & 0x000000FF; 
-                REG32(cnn_base, CNN_REG_DATA_IN) = sample_data;
-                
-                REG32(cnn_base, CNN_REG_CONTROL) = CNN_CTRL_START | CNN_CTRL_WREN;
-                REG32(cnn_base, CNN_REG_CONTROL) = CNN_CTRL_START;
+                int8_t raw_val = (int8_t)sector_buffer[i];
+                uint32_t sample_data = ((uint32_t)((int32_t)raw_val)) & 0xFF;
+                REG32(cnn_base, CNN_ECG_DATA_OFFSET) = sample_data;
+                REG32(cnn_base, CNN_ECG_VALID_OFFSET) = 1;
+                REG32(cnn_base, CNN_ECG_VALID_OFFSET) = 0;
             }
 
-            for (int p = 0; p < 3; p++) { 
-                REG32(cnn_base, CNN_REG_DATA_IN) = 0; 
-                REG32(cnn_base, CNN_REG_CONTROL) = CNN_CTRL_START | CNN_CTRL_WREN;
-                REG32(cnn_base, CNN_REG_CONTROL) = CNN_CTRL_START;
+            uint32_t timeout = 0;
+            uint32_t done_status = 0;
+            while (1) {
+                done_status = REG32(cnn_base, CNN_DONE_OFFSET) & 0x1;
+                if (done_status == 1) {
+                    break;
+                }
+                timeout++;
+                if (timeout > 500000) {
+                    kprintf("[ERROR] CNN Inference Timeout! (Class %d, Sample %d)\r\n", class_idx, s_idx);
+                    break;
+                }
             }
+            
+            uint32_t classification_result = REG32(cnn_base, CNN_CLASS_OFFSET);
+            uint8_t predicted_label = (uint8_t)(classification_result & 0x07);
 
-            REG32(cnn_base, CNN_REG_CONTROL) = CNN_CTRL_START | CNN_CTRL_WREN;
-            REG32(cnn_base, CNN_REG_CONTROL) = CNN_CTRL_START;
-
-            // STAGE 4: POLLING DONE_ALL
-            uint32_t timeout_done = 0;
-            while ((REG32(cnn_base, CNN_REG_DONE) & 0x01) == 0) {
-                if (++timeout_done > 100000) break;
-            }
-
-            uint32_t raw_class = REG32(cnn_base, CNN_REG_CLASSIFICATION);
-            uint8_t predicted_label = (uint8_t)(raw_class & 0x07);
-
-            REG32(cnn_base, CNN_REG_CONTROL) = 0; // Clear START
-
-            if (s_idx < 5) {
-                kprintf("[PREDICT] Expected Class = "); print_dec(class_idx);
-                kprintf(" | Got HW Class = "); print_dec(predicted_label);
-                if (predicted_label == class_idx) kprintf(" -> PASS\r\n");
-                else kprintf(" -> FAIL (Mismatched)\r\n");
-            }
-
-            if (predicted_label == class_idx) {
+            if (predicted_label == (uint8_t)class_idx) {
                 pass_count++;
             } else {
                 fail_count++;
             }
         }
 
-        class_pass_count[class_idx] = pass_count;
-        total_pass += pass_count;
-
-        uint32_t class_acc = (pass_count * 100) / SAMPLES_PER_CLASS;
-        kprintf("[TB] Class "); print_dec(class_idx);
-        kprintf(" Result: PASS="); print_dec(pass_count);
-        kprintf(", FAIL="); print_dec(fail_count);
-        kprintf(", ACCURACY="); print_dec(class_acc); kprintf("%%\r\n");
-        kprintf("--------------------------------------------------------\r\n\r\n");
+        total_pass_global += pass_count;
+        
+        int class_acc_int = (pass_count * 100) / SAMPLES_PER_CLASS;
+        int class_acc_frac = ((pass_count * 10000) / SAMPLES_PER_CLASS) % 100;
+        
+        kprintf("[C-TB] Class %d Result: PASS=%d FAIL=%d ACCURACY=%d.%02d%%\r\n", 
+                class_idx, pass_count, fail_count, class_acc_int, class_acc_frac);
     }
 
-    kprintf("[TB] ========================================================\r\n");
-    kprintf("[TB] FINAL SYSTEM REPORT:\r\n");
-    for (int c = 0; c < 6; c++) {
-        uint32_t acc = (class_pass_count[c] * 100) / SAMPLES_PER_CLASS;
-        kprintf("Class "); print_dec(c); kprintf(": ");
-        print_dec(acc); kprintf("%% | ");
-        kprintf((char*)CLASS_NAMES[c]);
-        kprintf("\r\n");
-    }
-    kprintf("[TB] --------------------------------------------------------\r\n");
-    uint32_t total_accuracy = (total_pass * 100) / (SAMPLES_PER_CLASS * 6);
-    kprintf("[TB] AVERAGE ACCURACY (6 CLASSES): "); print_dec(total_accuracy); kprintf("%%\r\n");
-    kprintf("[TB] ========================================================\r\n");
+    int total_acc_int = (total_pass_global * 100) / total_samples_global;
+    int total_acc_frac = ((total_pass_global * 10000) / total_samples_global) % 100;
+
+    kprintf("\r\n[C-TB] ========================================================\r\n");
+    kprintf("[C-TB] FINAL SYSTEM REPORT (%d samples/class):\r\n", SAMPLES_PER_CLASS);
+    kprintf("[C-TB] AVERAGE ACCURACY (6 CLASSES): %d.%02d%%\r\n", total_acc_int, total_acc_frac);
+    kprintf("[C-TB] ========================================================\r\n");
 
     while(1);
     return 0;
