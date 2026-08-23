@@ -65,14 +65,6 @@ class SmallRocketArty100TConfig extends Config(
   new chipyard.config.WithBroadcastManager ++
   new chipyard.TinyRocketConfig
 )
-class RocketArty100TConfig extends Config(
-  new WithTinyArty100TTweaks ++
-  new chipyard.config.WithBroadcastManager ++
-  new chipyard.RocketConfig
-)
-class AsconArty100TConfig extends Config(
-  new WithTinyArty100TTweaks ++
-  new chipyard.config.WithBroadcastManager ++
-  new chipyard.AsconRocketConfig
-)
+
+
 
