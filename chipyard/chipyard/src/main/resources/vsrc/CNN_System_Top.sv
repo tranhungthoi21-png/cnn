@@ -3,11 +3,339 @@
 //`include "Neural_Weight_Manager.v"
 //`include "cla_20bit.v"
 //`include "CNN_Global_Controller.v"
-//`include "cnn_uart_top.v"
 // =============================================================================
 // Module Name: CNN_System_Top
 // Description: Top-level wrapper for 6-layer CNN (ECG Classification)
 // =============================================================================
+`timescale 1ns/1ps
+module CNN_Wrapper (
+    input  wire        clk,
+    input  wire        rst_n,
+
+    // Weight SRAM load path
+    input  wire        config_mode,   // 1 = weight-load mode (passed through to CNN_System_Top)
+    input  wire        weight_valid,  // pulse: write weight_data at the current SRAM address
+    input  wire [19:0] weight_data,
+
+    // ECG sample input (buffered into ECG_FIFO ahead of start_infer)
+    input  wire        ecg_valid,     // pulse: write ecg_data at the current wr_ptr
+    input  wire [7:0]  ecg_data,
+
+    // Pulse to begin classifying the 200 buffered ECG samples
+    input  wire        start_infer,
+
+    output wire [2:0]  classification,  // holds the last result
+    output wire        done             // 1-cycle pulse when a new result is latched
+);
+
+    wire        cnn_rst_n;   // separate CNN core reset
+    wire        cnn_start;   // CNN start pulse
+    wire        cnn_ready;
+    wire [2:0]  cnn_class;
+    wire        cnn_done;
+
+    wire [7:0]  ecg_wr_ptr;
+    wire [7:0]  ecg_rd_ptr;
+    wire [7:0]  ecg_rd_data;
+
+    wire ecg_wr_en, ecg_wr_rst, ecg_rd_rst, ecg_rd_en;
+
+    wire [19:0] cpu_data_in;
+
+    CNN_Ctrl_FSM u_ctrl (
+        .clk            (clk),
+        .rst_n          (rst_n),
+        .start_infer    (start_infer),
+        .ecg_valid      (ecg_valid),
+        .ecg_wr_ptr     (ecg_wr_ptr),
+        .ecg_rd_ptr     (ecg_rd_ptr),
+        .cnn_ready      (cnn_ready),
+        .cnn_class      (cnn_class),
+        .cnn_done       (cnn_done),
+        .cnn_rst_n      (cnn_rst_n),
+        .cnn_start      (cnn_start),
+        .ecg_wr_en      (ecg_wr_en),
+        .ecg_wr_rst     (ecg_wr_rst),
+        .ecg_rd_rst     (ecg_rd_rst),
+        .ecg_rd_en      (ecg_rd_en),
+        .classification (classification),
+        .done           (done)
+    );
+
+    ECG_FIFO u_ecg_fifo (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .wr_en   (ecg_wr_en),
+        .wr_data (ecg_data),
+        .wr_rst  (ecg_wr_rst),
+        .rd_rst  (ecg_rd_rst),
+        .rd_en   (ecg_rd_en),
+        .wr_ptr  (ecg_wr_ptr),
+        .rd_ptr  (ecg_rd_ptr),
+        .rd_data (ecg_rd_data)
+    );
+
+    CNN_Data_Mux u_data_mux (
+        .sel_weight  (config_mode),
+        .weight_data (weight_data),
+        .sel_ecg     (ecg_rd_en),
+        .ecg_data    (ecg_rd_data),
+        .cpu_data_in (cpu_data_in)
+    );
+
+    CNN_System_Top u_cnn (
+        .clk            (clk),
+        .rst_n          (cnn_rst_n),
+        .start          (cnn_start),
+        .config_mode    (config_mode),
+        .cpu_data_in    (cpu_data_in),
+        .cpu_wr_en      (weight_valid),
+        .ready_for_data (cnn_ready),
+        .classification (cnn_class),
+        .done_all       (cnn_done)
+    );
+
+endmodule
+module CNN_Ctrl_FSM (
+    input  wire        clk,
+    input  wire        rst_n,
+
+    input  wire        start_infer,
+    input  wire        ecg_valid,
+    input  wire [7:0]  ecg_wr_ptr,
+    input  wire [7:0]  ecg_rd_ptr,
+
+    input  wire        cnn_ready,
+    input  wire [2:0]  cnn_class,
+    input  wire        cnn_done,
+
+    output reg          cnn_rst_n,   // separate CNN core reset
+    output reg          cnn_start,   // CNN start pulse
+
+    output wire          ecg_wr_en,
+    output wire          ecg_wr_rst,
+    output wire          ecg_rd_rst,
+    output wire          ecg_rd_en,   // also: mux-select ECG data in CNN_Data_Mux
+
+    output reg  [2:0]   classification,  // holds the last result
+    output reg          done             // 1-cycle pulse when a new result is latched
+);
+    localparam S_IDLE       = 4'd0;
+    localparam S_INFER_RST  = 4'd1;
+    localparam S_RECV_ECG   = 4'd2;
+    localparam S_CNN_RESET  = 4'd3;
+    localparam S_CNN_START  = 4'd4;
+    localparam S_WAIT_READY = 4'd5;
+    localparam S_PRE_PAD    = 4'd6;
+    localparam S_FEED_DATA  = 4'd7;
+    localparam S_POST_PAD   = 4'd8;
+    localparam S_WAIT_DONE  = 4'd9;
+    localparam S_RESULT     = 4'd10;
+
+    localparam RESET_CYCLES = 8'd100;
+
+    reg [3:0] state;
+    reg [7:0] feed_cnt;   // 0..205 for data feeding
+    reg [7:0] rst_cnt;    // CNN reset pulse duration counter
+
+    reg       done_captured;  // latched done_all
+    reg [2:0] class_latch;    // latched classification
+
+    // Internal state predicates, combined here into plain FIFO commands.
+    wire in_recv_ecg    = (state == S_RECV_ECG);
+    wire in_wait_ready  = (state == S_WAIT_READY);
+    wire in_pre_pad     = (state == S_PRE_PAD);
+    wire in_feed_data   = (state == S_FEED_DATA);
+    wire pre_pad_rd_rst = in_pre_pad && (feed_cnt == 8'd3);
+    wire ecg_ptr_rst    = (state == S_INFER_RST) && (rst_cnt == RESET_CYCLES - 8'd1);
+
+    assign ecg_wr_en  = in_recv_ecg && ecg_valid;
+    assign ecg_wr_rst = ecg_ptr_rst;
+    assign ecg_rd_rst = ecg_ptr_rst || (in_wait_ready && cnn_ready) || pre_pad_rd_rst;
+    assign ecg_rd_en  = in_feed_data;
+
+    always @(posedge clk or negedge cnn_rst_n) begin
+        if (!cnn_rst_n) begin
+            done_captured <= 1'b0;
+            class_latch   <= 3'd0;
+        end else begin
+            if (cnn_done) begin
+                done_captured <= 1'b1;
+                class_latch   <= cnn_class;
+            end else if (state == S_RESULT) begin
+                done_captured <= 1'b0;  // clear after consumption
+            end
+        end
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state          <= S_IDLE;
+            cnn_rst_n      <= 1'b0;
+            cnn_start      <= 1'b0;
+            feed_cnt       <= 8'd0;
+            rst_cnt        <= 8'd0;
+            classification <= 3'd0;
+            done           <= 1'b0;
+        end else begin
+            // Default outputs
+            cnn_start <= 1'b0;
+            done      <= 1'b0;
+
+            case (state)
+                S_IDLE: begin
+                    cnn_rst_n <= 1'b1;
+                    if (start_infer) begin
+                        state     <= S_INFER_RST;
+                        cnn_rst_n <= 1'b0;   // assert CNN reset now
+                        rst_cnt   <= 8'd0;
+                    end
+                end
+
+                S_INFER_RST: begin
+                    cnn_rst_n <= 1'b0;                  // keep CNN in reset
+                    rst_cnt   <= rst_cnt + 8'd1;
+                    if (rst_cnt == RESET_CYCLES - 8'd1) begin  // 100 cycles done
+                        cnn_rst_n  <= 1'b1;             // release reset
+                        state      <= S_RECV_ECG;
+                        // ecg_wr_ptr / ecg_rd_ptr reset to 0 (ecg_ptr_rst) happens inside ECG_FIFO
+                        feed_cnt   <= 8'd0;
+                    end
+                end
+
+                S_RECV_ECG: begin
+                    // ECG byte write into the FIFO happens inside ECG_FIFO;
+                    // ecg_wr_ptr is its current value.
+                    if (ecg_valid) begin
+                        if (ecg_wr_ptr == 8'd199) begin
+                            state   <= S_CNN_RESET;
+                            rst_cnt <= 8'd0;
+                        end
+                    end
+                end
+
+                S_CNN_RESET: begin
+                    cnn_rst_n <= 1'b0;  // Assert reset
+                    rst_cnt   <= rst_cnt + 8'd1;
+                    if (rst_cnt == 8'd7) begin  // 8 cycles of reset
+                        cnn_rst_n <= 1'b1;  // Release reset
+                        state     <= S_CNN_START;
+                    end
+                end
+
+                S_CNN_START: begin
+                    cnn_rst_n <= 1'b1;
+                    cnn_start <= 1'b1;  // 1-cycle pulse
+                    state     <= S_WAIT_READY;
+                end
+
+                S_WAIT_READY: begin
+                    if (cnn_ready) begin
+                        state    <= S_PRE_PAD;
+                        feed_cnt <= 8'd1;  // byte 0 already fed in WAIT_READY
+                        // ecg_rd_ptr reset to 0 happens inside ECG_FIFO
+                    end
+                end
+
+                S_PRE_PAD: begin
+                    feed_cnt <= feed_cnt + 8'd1;
+                    if (feed_cnt == 8'd3) begin  // 4 leading zeros -> ecg0 at ready_edge+5 (matches golden)
+                        state    <= S_FEED_DATA;
+                        feed_cnt <= 8'd0;
+                        // ecg_rd_ptr reset to 0 (pre_pad_rd_rst) happens inside ECG_FIFO
+                    end
+                end
+
+                S_FEED_DATA: begin
+                    // ecg_rd_ptr increment happens inside ECG_FIFO
+                    if (ecg_rd_ptr == 8'd199) begin
+                        state    <= S_POST_PAD;
+                        feed_cnt <= 8'd0;
+                    end
+                end
+
+                S_POST_PAD: begin
+                    feed_cnt <= feed_cnt + 8'd1;
+                    if (feed_cnt == 8'd2) begin  // 3 zeros sent
+                        state <= S_WAIT_DONE;
+                    end
+                end
+
+                S_WAIT_DONE: begin
+                    if (done_captured) begin
+                        state <= S_RESULT;
+                    end
+                end
+
+                S_RESULT: begin
+                    classification <= class_latch;
+                    done           <= 1'b1;  // 1-cycle pulse
+                    state          <= S_IDLE;
+                end
+
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+
+endmodule
+module CNN_Data_Mux (
+    input  wire        sel_weight,
+    input  wire [19:0] weight_data,
+    input  wire        sel_ecg,
+    input  wire [7:0]  ecg_data,
+    output wire [19:0] cpu_data_in
+);
+
+    assign cpu_data_in = sel_weight ? weight_data :
+                          sel_ecg   ? {12'd0, ecg_data} : 20'd0;
+
+endmodule
+module ECG_FIFO (
+    input  wire       clk,
+    input  wire       rst_n,
+
+    input  wire       wr_en,    // write wr_data at wr_ptr, then wr_ptr++
+    input  wire [7:0] wr_data,
+    input  wire       wr_rst,   // wr_ptr <= 0
+
+    input  wire       rd_rst,   // rd_ptr <= 0
+    input  wire       rd_en,    // rd_ptr++
+
+    output wire [7:0] wr_ptr,
+    output wire [7:0] rd_ptr,
+    output wire [7:0] rd_data
+);
+
+    reg [7:0] mem [0:199];
+    reg [7:0] wr_ptr_r;
+    reg [7:0] rd_ptr_r;
+
+    assign wr_ptr  = wr_ptr_r;
+    assign rd_ptr  = rd_ptr_r;
+    assign rd_data = mem[rd_ptr_r];
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wr_ptr_r <= 8'd0;
+            rd_ptr_r <= 8'd0;
+        end else begin
+            if (wr_rst) begin
+                wr_ptr_r <= 8'd0;
+            end else if (wr_en) begin
+                mem[wr_ptr_r] <= wr_data;
+                wr_ptr_r      <= wr_ptr_r + 8'd1;
+            end
+
+            if (rd_rst) begin
+                rd_ptr_r <= 8'd0;
+            end else if (rd_en) begin
+                rd_ptr_r <= rd_ptr_r + 8'd1;
+            end
+        end
+    end
+
+endmodule
 
 
 module CNN_System_Top (
@@ -320,10 +648,6 @@ module Conv1_Top (
             end
         end
     end
-
-    // ---------------------------------------------------------
-    // 2. KH?I SHIFT REGISTER D? LI?U
-    // ---------------------------------------------------------
     reg signed [7:0] d0, d1, d2, d3, d4, d5, d6;
   always @(posedge clk ) begin
         if (!rst_n) begin
@@ -337,10 +661,6 @@ module Conv1_Top (
             end
         end
     end
-
-    // ---------------------------------------------------------
-    // 3. KH?I QU?N LÝ TR?NG S? (Scan-chain)
-    // ---------------------------------------------------------
     reg [19:0] w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, 
                w14, w15, w16, w17, w18, w19, w20, w21, w22, w23, w24, w25, w26, w27;
 
@@ -355,15 +675,9 @@ module Conv1_Top (
             w5  <= w6;  w4  <= w5;  w3  <= w4;  w2  <= w3;  w1  <= w2;  w0  <= w1;
         end
     end
-
-    // ---------------------------------------------------------
-    // 4. KH?I TÍNH TOÁN & CÂY C?NG PIPELINE (ÐÃ T?I UU CHO FPGA)
-    // ---------------------------------------------------------
     
-    // 1. Khai báo wire k?t n?i tr?c ti?p t? ngõ ra PE
     wire signed [15:0] p0[0:6], p1[0:6], p2[0:6], p3[0:6];
 
-    // 2. Kh?i t?o các PE cho Filter 0, 1, 2, 3
     // Filter 0
     pe_direct pe0_0 (clk, d6, w0,  p0[0]); pe_direct pe0_1 (clk, d5, w4,  p0[1]); 
     pe_direct pe0_2 (clk, d4, w8,  p0[2]); pe_direct pe0_3 (clk, d3, w12, p0[3]); 
@@ -397,7 +711,7 @@ module Conv1_Top (
         p36_delay <= p3[6];
     end
 
-    // --- CÂY C?NG PIPELINE CHO FILTER 0 ---
+
     reg signed [15:0] f0_s1_01, f0_s1_23, f0_s1_45;
     reg signed [15:0] f0_s2_0123, f0_s2_456;
 
@@ -2031,6 +2345,7 @@ module singleport_bram #(
     end
 endmodule
 
+
 module CNN_Global_Controller (
     input  wire        clk,
     input  wire        rst_n,
@@ -2285,3 +2600,6 @@ module CNN_Global_Controller (
 
 endmodule
 `default_nettype wire
+
+
+
