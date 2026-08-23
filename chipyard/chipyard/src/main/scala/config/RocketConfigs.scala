@@ -9,7 +9,11 @@ import chipyard.ASCON.WithAsconRoCC
 // --------------
 // Rocket Configs
 // --------------
-
+class CNNWorkloadConfig extends Config(
+  new chipyard.CNNmod.WithCNNmod(base = 0x06400000L, width = 32) ++
+  new freechips.rocketchip.subsystem.WithNBigCores(1) ++
+  new chipyard.config.AbstractConfig
+)
 class RocketConfig extends Config(
   new freechips.rocketchip.subsystem.WithNoMemPort ++                 // Ng?t c?ng DRAM ngoài
   new testchipip.WithMbusScratchpad(size = BigInt(64 << 10)) ++        // G?n Scratchpad 64KB tr?c ti?p vào MBUS
@@ -38,7 +42,7 @@ class TinyRocketConfig extends Config(
   new chipyard.CNNmod.WithCNNmod(base = 0x06400000L, width = 32) ++
   new chipyard.iobinders.WithDontTouchIOBinders(false) ++         // TODO FIX: Don't dontTouch the ports
   new freechips.rocketchip.subsystem.WithIncoherentBusTopology ++
-  new freechips.rocketchip.subsystem.WithNBanks(0) ++            
+  new freechips.rocketchip.subsystem.WithNBanks(1) ++            
   new freechips.rocketchip.subsystem.WithNoMemPort ++
   new freechips.rocketchip.subsystem.With1TinyCore ++          // single rocket-core
   new chipyard.config.AbstractConfig)
