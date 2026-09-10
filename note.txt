@@ -21,4 +21,3 @@ sudo minicom -D /dev/ttyUSB1 -b 115200
 
 ---------------------------------------------------------------------------
 
-make bitstream SUB_PROJECT=arty100t CONFIG=SmallRocketArty100TConfig
